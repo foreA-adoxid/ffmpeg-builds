@@ -1,1 +1,1 @@
-# ffmpeg-builds
+# Сборки ffmpeg под windows/macos/linux
