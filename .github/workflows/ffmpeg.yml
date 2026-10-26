@@ -1,127 +1,104 @@
-name: Download FFmpeg binaries (manual)
+name: Build FFmpeg binaries (manual)
 
 on:
   workflow_dispatch:
     inputs:
       ffmpeg_version:
-        description: "FFmpeg version from ffmpeg-static releases (e.g. 7.1.1, 8.0.1)"
-        required: false
-        default: "6.1.1"
+        description: Stable FFmpeg source release
+        required: true
+        default: "9.0.2"
+        type: string
+      publish:
+        description: Publish verified binaries to the PulseSync updater release
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
-  group: ffmpeg-download-${{ github.ref }}
+  group: ffmpeg-build-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  download:
-    name: ${{ matrix.name }}
+  build:
+    name: ${{ matrix.target }}-${{ matrix.arch }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: linux-x86_64
-            runner: ubuntu-latest
+          - runner: ubuntu-latest
             target: linux
             arch: x86_64
-            ffmpeg_static_name: linux-x64
 
-          - name: macos-x86_64
-            runner: macos-15-intel
+          - runner: macos-26-intel
             target: macos
             arch: x86_64
-            ffmpeg_static_name: darwin-x64
 
-          - name: macos-arm64
-            runner: macos-latest
+          - runner: macos-26
             target: macos
             arch: arm64
-            ffmpeg_static_name: darwin-arm64
 
-          - name: windows-x86_64
-            runner: ubuntu-latest
+          - runner: windows-latest
             target: windows
             arch: x86_64
-            ffmpeg_static_name: win32-x64
 
     runs-on: ${{ matrix.runner }}
-
+    env:
+      FFMPEG_VERSION: ${{ inputs.ffmpeg_version }}
+      BUILD_TARGET: ${{ matrix.target }}
+      BUILD_ARCH: ${{ matrix.arch }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download FFmpeg binary from ffmpeg-static
+      - name: Install Windows build tools
+        if: matrix.target == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel automake-wrapper curl gnupg nasm
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-zlib
+
+      - name: Build Windows binary
+        if: matrix.target == 'windows'
+        shell: msys2 {0}
+        run: bash .github/scripts/build-ffmpeg.sh
+
+      - name: Install macOS build tools
+        if: matrix.target == 'macos'
+        shell: bash
+        run: brew install automake nasm pkg-config gnupg
+
+      - name: Build macOS binary
+        if: matrix.target == 'macos'
+        shell: bash
+        run: bash .github/scripts/build-ffmpeg.sh
+
+      - name: Build static Linux binary with musl
+        if: matrix.target == 'linux'
         shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p dist/bin
-          
-          FFMPEG_VERSION="${{ inputs.ffmpeg_version }}"
-          FFMPEG_STATIC_NAME="${{ matrix.ffmpeg_static_name }}"
-          
-          # Construct the download URL
-          # ffmpeg-static format: https://github.com/eugeneware/ffmpeg-static/releases/download/b{version}/ffmpeg-{name}
-          DOWNLOAD_URL="https://github.com/eugeneware/ffmpeg-static/releases/download/b${FFMPEG_VERSION}/ffmpeg-${FFMPEG_STATIC_NAME}"
-          
-          if [ "${{ matrix.target }}" = "windows" ]; then
-            BIN_PATH="dist/bin/ffmpeg.exe"
-          else
-            BIN_PATH="dist/bin/ffmpeg"
-          fi
-          
-          echo "Downloading from: ${DOWNLOAD_URL}"
-          curl -L --retry 5 --retry-delay 2 -o "${BIN_PATH}" "${DOWNLOAD_URL}"
-          
-          # Make executable (non-Windows)
-          if [ "${{ matrix.target }}" != "windows" ]; then
-            chmod +x "${BIN_PATH}"
-          fi
-          
-          echo "Downloaded: ${BIN_PATH}"
-          file "${BIN_PATH}" || true
+          docker run --rm \
+            -e FFMPEG_VERSION -e BUILD_TARGET -e BUILD_ARCH \
+            -v "$PWD:/workspace" -w /workspace alpine:3.22 \
+            sh -ec 'apk add --no-cache bash build-base automake curl gnupg nasm perl pkgconf linux-headers zlib-dev zlib-static && bash .github/scripts/build-ffmpeg.sh'
 
-      - name: Package artifact (tar.gz only ffmpeg binary) + sha256 of binary
-        shell: bash
+      - name: Check Windows binary without the MSYS2 runtime on PATH
+        if: matrix.target == 'windows'
+        shell: pwsh
         run: |
-          set -euo pipefail
-          ARTIFACT="ffmpeg-${{ matrix.target }}-${{ matrix.arch }}"
-          mkdir -p out
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          & ./dist/bin/ffmpeg.exe -version
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg cannot run independently of MSYS2" }
 
-          if [ "${{ matrix.target }}" = "windows" ]; then
-            BIN="dist/bin/ffmpeg.exe"
-          else
-            BIN="dist/bin/ffmpeg"
-          fi
-
-          if [ ! -f "${BIN}" ]; then
-            echo "Expected binary not found: ${BIN}"
-            echo "dist tree:"
-            find dist -maxdepth 3 -type f -print
-            exit 1
-          fi
-
-          TAR_PATH="out/${ARTIFACT}.tar.gz"
-          SHA_PATH="out/${ARTIFACT}.sha256"
-
-          # 1) sha256 of the binary itself (this is what your updater wants)
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${BIN}" | awk '{print $1}' > "${SHA_PATH}"
-          else
-            shasum -a 256 "${BIN}" | awk '{print $1}' > "${SHA_PATH}"
-          fi
-
-          # 2) tar.gz only the ffmpeg binary (no paths)
-          # Use -C to avoid embedding dist/bin path in the archive
-          tar -C "$(dirname "${BIN}")" -czf "${TAR_PATH}" "$(basename "${BIN}")"
-
-          echo "Created ${TAR_PATH}"
-          echo "Created ${SHA_PATH} (sha256 of binary)"
-          ls -la out
-
-      - name: Upload artifact
+      - name: Upload verified build
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-${{ matrix.target }}-${{ matrix.arch }}
@@ -130,17 +107,24 @@ jobs:
 
   release:
     name: Publish release assets
-    needs: download
+    if: inputs.publish
+    needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/download-artifact@v4
 
-      - name: Create / update release
+      - name: Create or update updater release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ffmpeg-binaries
-          name: FFmpeg prebuilt binaries
+          name: FFmpeg ${{ inputs.ffmpeg_version }} binaries
+          body: |
+            FFmpeg ${{ inputs.ffmpeg_version }} built from signed upstream sources for PulseSync.
+            Build configuration, source checksums and licenses are included in the per-platform source archives.
+            The .sha256 files contain the SHA-256 of the executable, as required by the PulseSync updater.
           prerelease: false
           make_latest: false
           fail_on_unmatched_files: true
