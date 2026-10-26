@@ -53,18 +53,29 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
+
+      - name: Restore source and compiler caches
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            .build/downloads
+            .build/ccache
+          key: ffmpeg-v1-${{ matrix.runner }}-${{ matrix.arch }}-${{ hashFiles('.github/scripts/build-ffmpeg.sh') }}-${{ inputs.ffmpeg_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ffmpeg-v1-${{ matrix.runner }}-${{ matrix.arch }}-${{ hashFiles('.github/scripts/build-ffmpeg.sh') }}-${{ inputs.ffmpeg_version }}-
+            ffmpeg-v1-${{ matrix.runner }}-${{ matrix.arch }}-${{ hashFiles('.github/scripts/build-ffmpeg.sh') }}-
 
       - name: Install Windows build tools
         if: matrix.target == 'windows'
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@v2.33.0
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             base-devel automake-wrapper curl gnupg nasm
-            mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-zlib
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-zlib mingw-w64-ucrt-x86_64-ccache
 
       - name: Build Windows binary
         if: matrix.target == 'windows'
@@ -74,7 +85,7 @@ jobs:
       - name: Install macOS build tools
         if: matrix.target == 'macos'
         shell: bash
-        run: brew install automake nasm pkg-config gnupg
+        run: brew install automake nasm pkg-config gnupg ccache
 
       - name: Build macOS binary
         if: matrix.target == 'macos'
@@ -88,7 +99,7 @@ jobs:
           docker run --rm \
             -e FFMPEG_VERSION -e BUILD_TARGET -e BUILD_ARCH \
             -v "$PWD:/workspace" -w /workspace alpine:3.22 \
-            sh -ec 'apk add --no-cache bash build-base automake curl gnupg nasm perl pkgconf linux-headers zlib-dev zlib-static && bash .github/scripts/build-ffmpeg.sh'
+            sh -ec 'apk add --no-cache bash build-base automake curl gnupg nasm perl pkgconf linux-headers zlib-dev zlib-static ccache && bash .github/scripts/build-ffmpeg.sh'
 
       - name: Check Windows binary without the MSYS2 runtime on PATH
         if: matrix.target == 'windows'
@@ -99,7 +110,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "FFmpeg cannot run independently of MSYS2" }
 
       - name: Upload verified build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ffmpeg-${{ matrix.target }}-${{ matrix.arch }}
           path: out/*
@@ -114,10 +125,10 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.2
 
       - name: Create or update updater release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: ffmpeg-binaries
           name: FFmpeg ${{ inputs.ffmpeg_version }} binaries

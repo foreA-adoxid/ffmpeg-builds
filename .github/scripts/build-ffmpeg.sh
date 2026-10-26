@@ -9,28 +9,49 @@ set -euo pipefail
   exit 1
 }
 case "$BUILD_TARGET/$BUILD_ARCH/$(uname -s)/$(uname -m)" in
-  linux/x86_64/Linux/x86_64|macos/x86_64/Darwin/x86_64|macos/arm64/Darwin/arm64|windows/x86_64/MINGW64_NT-*/x86_64) ;;
+  linux/x86_64/Linux/x86_64|macos/x86_64/Darwin/x86_64|macos/arm64/Darwin/arm64|windows/x86_64/MINGW64_NT-*/x86_64|windows/x86_64/UCRT64_NT-*/x86_64) ;;
   *) echo 'Unsupported target or runner architecture' >&2; exit 1 ;;
 esac
 
 ROOT="$(pwd)"
 BUILD="$ROOT/.build/$BUILD_TARGET-$BUILD_ARCH-$FFMPEG_VERSION"
 PREFIX="$BUILD/prefix"
+DOWNLOAD_CACHE="$ROOT/.build/downloads"
 JOBS="${BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
 LAME_VERSION=3.100
 LAME_SHA256=ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
 OPENSSL_VERSION=3.5.9
 OPENSSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 FFMPEG_SIGNER=FCF986EA15E6E293A5644F10B4322F04D67658D8
-mkdir -p "$BUILD/downloads" "$PREFIX" "$ROOT/dist/bin" "$ROOT/out"
+mkdir -p "$BUILD/downloads" "$DOWNLOAD_CACHE" "$PREFIX" "$ROOT/dist/bin" "$ROOT/out"
 if [[ "$BUILD_TARGET" == macos ]]; then
   export MACOSX_DEPLOYMENT_TARGET=10.15
   [[ "$BUILD_ARCH" != arm64 ]] || export MACOSX_DEPLOYMENT_TARGET=11.0
 fi
 
+# ccache hashes the real compiler and headers, even after a runner toolchain update.
+export CCACHE_DIR="$ROOT/.build/ccache"
+export CCACHE_BASEDIR="$ROOT"
+export CCACHE_COMPILERCHECK=content
+export CCACHE_NAMESPACE="$BUILD_TARGET-$BUILD_ARCH-${MSYSTEM:-native}"
+export CCACHE_MAXSIZE=1G
+export CCACHE_UMASK=0022
+export CC="ccache ${CC:-cc}"
+ccache --zero-stats
+trap 'ccache --show-stats || true' EXIT
+
 download() {
+  local cache_name="${3:-}"
+  if [[ -n "$cache_name" && -s "$DOWNLOAD_CACHE/$cache_name" ]]; then
+    echo "Using cached source: $cache_name"
+    cp "$DOWNLOAD_CACHE/$cache_name" "$BUILD/downloads/$2"
+    return
+  fi
   curl --fail --location --retry 5 --retry-delay 2 --connect-timeout 30 \
     --output "$BUILD/downloads/$2" "$1"
+  if [[ -n "$cache_name" ]]; then
+    cp "$BUILD/downloads/$2" "$DOWNLOAD_CACHE/$cache_name"
+  fi
 }
 hash() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -45,8 +66,8 @@ verify_hash() {
   }
 }
 
-download "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" ffmpeg.tar.xz
-download "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz.asc" ffmpeg.tar.xz.asc
+download "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" ffmpeg.tar.xz "ffmpeg-$FFMPEG_VERSION.tar.xz"
+download "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz.asc" ffmpeg.tar.xz.asc "ffmpeg-$FFMPEG_VERSION.tar.xz.asc"
 download https://ffmpeg.org/ffmpeg-devel.asc ffmpeg-devel.asc
 mkdir -p "$BUILD/gnupg"
 chmod 700 "$BUILD/gnupg"
@@ -58,7 +79,7 @@ awk -v signer="$FFMPEG_SIGNER" \
   '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == signer || $NF == signer) { valid=1 } END { exit !valid }' \
   "$BUILD/signature.status"
 
-download "https://downloads.sourceforge.net/project/lame/lame/$LAME_VERSION/lame-$LAME_VERSION.tar.gz" lame.tar.gz
+download "https://downloads.sourceforge.net/project/lame/lame/$LAME_VERSION/lame-$LAME_VERSION.tar.gz" lame.tar.gz "lame-$LAME_VERSION.tar.gz"
 verify_hash lame.tar.gz "$LAME_SHA256"
 mkdir -p "$BUILD/lame" "$BUILD/ffmpeg"
 tar -xf "$BUILD/downloads/lame.tar.gz" -C "$BUILD/lame" --strip-components=1
@@ -76,7 +97,7 @@ TLS_FLAGS=()
 LINK_FLAGS=()
 case "$BUILD_TARGET" in
   linux)
-    download "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz" openssl.tar.gz
+    download "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz" openssl.tar.gz "openssl-$OPENSSL_VERSION.tar.gz"
     verify_hash openssl.tar.gz "$OPENSSL_SHA256"
     mkdir -p "$BUILD/openssl"
     tar -xf "$BUILD/downloads/openssl.tar.gz" -C "$BUILD/openssl" --strip-components=1
@@ -98,7 +119,7 @@ case "$BUILD_TARGET" in
 esac
 
 cd "$BUILD/ffmpeg"
-./configure --prefix="$ROOT/dist" --disable-autodetect --disable-shared --enable-static \
+./configure --cc="$CC" --prefix="$ROOT/dist" --disable-autodetect --disable-shared --enable-static \
   --disable-debug --disable-doc --disable-ffplay --disable-ffprobe \
   --enable-gpl --enable-version3 --enable-libmp3lame --enable-zlib \
   --pkg-config-flags=--static --extra-cflags="-I$PREFIX/include" \
